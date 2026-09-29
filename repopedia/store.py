@@ -209,6 +209,33 @@ class Store:
         self._conn.commit()
         return cur.rowcount
 
+    def most_called(self, limit: int = 15) -> list[dict]:
+        """Functions/methods with the most in-repo callers.
+
+        Single GROUP BY query — used by the wiki architecture page.
+        Returns ``[{qualified_name, kind, file, line_start, caller_count}]``
+        ordered by caller_count desc, then name (deterministic).
+        """
+        rows = self._conn.execute(
+            """SELECT n.qualified_name, n.kind, n.file, n.line_start,
+                      COUNT(*) AS c
+               FROM edges e JOIN nodes n ON n.id = e.dst
+               WHERE e.kind = 'calls' AND n.kind IN ('function', 'method')
+               GROUP BY e.dst ORDER BY c DESC, n.qualified_name ASC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "qualified_name": r[0],
+                "kind": r[1],
+                "file": r[2],
+                "line_start": r[3],
+                "caller_count": r[4],
+            }
+            for r in rows
+        ]
+
     def inbound_source_files(self, files: list[str]) -> list[str]:
         """Distinct files (outside ``files``) with edges pointing into them."""
         if not files:

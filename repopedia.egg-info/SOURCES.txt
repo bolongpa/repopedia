@@ -6,9 +6,12 @@ repopedia/__main__.py
 repopedia/cli.py
 repopedia/incremental.py
 repopedia/index.py
+repopedia/llm.py
+repopedia/mcp_server.py
 repopedia/query.py
 repopedia/search.py
 repopedia/store.py
+repopedia/wiki.py
 repopedia.egg-info/PKG-INFO
 repopedia.egg-info/SOURCES.txt
 repopedia.egg-info/dependency_links.txt
@@ -21,5 +24,7 @@ repopedia/extract/python.py
 repopedia/extract/typescript.py
 tests/test_incremental.py
 tests/test_index.py
+tests/test_mcp.py
 tests/test_query.py
 tests/test_search.py
+tests/test_wiki.py

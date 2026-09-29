@@ -15,6 +15,7 @@ dependencies = [
     "tree-sitter==0.26.0",
     "tree-sitter-python==0.25.0",
     "tree-sitter-typescript==0.23.2",
+    "mcp>=1.0,<2",
 ]
 
 [project.optional-dependencies]

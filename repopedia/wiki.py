@@ -1,0 +1,388 @@
+"""Wiki generator: Markdown pages + Mermaid diagrams derived FROM the graph.
+
+``repopedia wiki <repo> --out docs/`` writes:
+
+    docs/index.md            repo overview (languages, stats, module list)
+    docs/modules/<mod>.md   one page per top-level module
+    docs/architecture.md     module dependency graph + most-called functions
+
+Every structural claim cites ``file:line``. Diagrams are generated from
+edges, not hallucinated. Output is deterministic: same graph ->
+byte-identical markdown (everything sorted, no timestamps).
+
+Two modes:
+- With an LLM configured (same env as ask_codebase): short prose overview
+  and per-module summaries are synthesized under a strict cite-only-what-
+  you're-given prompt. Tables and diagrams always carry the citations.
+- Without: a purely structural wiki — tables + diagrams, no prose claims.
+  Genuinely useful on its own (it answers "what lives where").
+
+Before generating, the staleness of the graph is checked against git HEAD
+(see ``staleness_warning``); a warning is printed AND embedded in index.md.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+from . import query as Q
+from .incremental import META_SHA_KEY, get_head_sha, is_git_repo
+from .store import open_store
+
+MAX_MODULES_DIAGRAM = 25
+MAX_MOST_CALLED = 15
+
+
+# -- staleness --------------------------------------------------------------
+def staleness_warning(repo: Path, store) -> str | None:
+    """Compare the graph's ``head_sha`` against git HEAD.
+
+    Returns a warning string, or None when the graph is fresh.
+    """
+    if not is_git_repo(repo):
+        return (
+            f"warning: {repo} is not a git repository — the wiki reflects "
+            "the last indexed state, which may be outdated."
+        )
+    recorded = store.get_meta(META_SHA_KEY)
+    current = get_head_sha(repo)
+    if recorded is None:
+        return (
+            "warning: no recorded index commit (head_sha) — run "
+            "`repopedia update` to establish a baseline; the wiki may be stale."
+        )
+    if current is None:
+        return "warning: could not read git HEAD — the wiki may be stale."
+    if recorded != current:
+        return (
+            f"warning: graph was built from commit {recorded[:8]} but HEAD is "
+            f"{current[:8]} — run `repopedia update` (or a full "
+            "`repopedia index`) before trusting this wiki. Note: previously "
+            "unresolved references in unchanged files only heal on a full reindex."
+        )
+    return None
+
+
+# -- helpers -----------------------------------------------------------------
+def _top_module(file: str) -> str:
+    parts = Path(file).parts
+    return parts[0] if len(parts) > 1 else "root"
+
+
+def _safe_id(text: str) -> str:
+    return re.sub(r"\W", "_", text)
+
+
+def _mermaid_block(kind: str, body: str) -> str:
+    return f"```{kind}\n{body}\n```"
+
+
+def _lang_breakdown(store) -> list[tuple[str, int]]:
+    rows = store._conn.execute(
+        "SELECT language, COUNT(*) c FROM nodes WHERE kind != 'file' "
+        "GROUP BY language ORDER BY c DESC, language ASC"
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+def _module_files(store) -> dict[str, list[str]]:
+    """Top-level module -> sorted repo-relative file paths."""
+    mods: dict[str, set[str]] = {}
+    for n in store.all_nodes():
+        if n["kind"] != "file":
+            continue
+        mods.setdefault(_top_module(n["file"]), set()).add(n["file"])
+    return {m: sorted(fs) for m, fs in sorted(mods.items())}
+
+
+def _module_imports(store, files: list[str]) -> dict[str, list[str]]:
+    """This module's files -> distinct *other* modules they import.
+
+    Resolved imports map to the target file's module; unresolved ones keep
+    the raw module string (marked as external).
+    """
+    merged: set[str] = set()
+    own: str | None = None
+    for f in files:
+        if own is None:
+            own = _top_module(f)
+        fnode = store.file_node(f)
+        if not fnode:
+            continue
+        for e in store.out_edges(fnode["id"], "imports"):
+            tgt_mod = None
+            if e["dst"] is not None:
+                target = store.get_node(e["dst"])
+                if target:
+                    tgt_mod = _top_module(target["file"])
+            raw = e["data"].get("module", "?")
+            merged.add(tgt_mod if tgt_mod else f"external:{raw}")
+    merged.discard(own)
+    return {"imports": sorted(merged)}
+
+
+# -- page builders -------------------------------------------------------------
+def _build_index(repo_name: str, store, warning: str | None,
+                 llm=None) -> str:
+    stats = store.stats()
+    n_nodes = sum(stats["nodes"].values())
+    n_edges = sum(stats["edges"].values())
+    n_files = stats["nodes"].get("file", 0)
+    mods = _module_files(store)
+    langs = _lang_breakdown(store)
+
+    lines = [f"# {repo_name}", ""]
+    if warning:
+        lines += [f"> ⚠️ {warning}", ""]
+    lines += [
+        "Generated by [repopedia](https://github.com/bolongpa/repopedia) "
+        "from the repository's code knowledge graph. Every structural claim "
+        "cites `file:line`; diagrams are derived from graph edges.",
+        "",
+        "## Overview",
+        "",
+        f"- **Files indexed:** {n_files}",
+        f"- **Symbols:** {n_nodes - n_files} "
+        f"({', '.join(f'{k}: {v}' for k, v in sorted(stats['nodes'].items()) if k != 'file')})",
+        f"- **Relationships:** {n_edges} "
+        f"({', '.join(f'{k}: {v}' for k, v in sorted(stats['edges'].items()))})",
+        f"- **Languages:** {', '.join(f'{lang} ({c})' for lang, c in langs) or '—'}",
+        "",
+    ]
+    if llm is not None:
+        facts = (
+            f"Repository {repo_name}: {n_files} files, "
+            f"{n_nodes - n_files} symbols, languages "
+            + ", ".join(f"{l} ({c})" for l, c in langs)
+            + ". Top-level modules: " + ", ".join(sorted(mods))
+        )
+        prose = llm.complete(
+            "You are a technical writer. Write 3-5 sentences describing what "
+            "this codebase appears to be, using ONLY the facts given. Do not "
+            "mention specific symbols, files, or line numbers — the tables "
+            "below carry all citations. Do not invent anything.",
+            f"Facts: {facts}",
+            max_tokens=300,
+        )
+        lines += [prose, ""]
+    lines += ["## Modules", ""]
+    if mods:
+        for mod, files in mods.items():
+            sym_count = sum(
+                1 for n in store.all_nodes()
+                if n["kind"] != "file" and _top_module(n["file"]) == mod
+            )
+            lines.append(
+                f"- [{mod}](modules/{mod}.md) — {len(files)} files, "
+                f"{sym_count} symbols"
+            )
+    else:
+        lines.append("_No modules found — the graph is empty._")
+    lines += ["", "See [architecture](architecture.md) for the module "
+                   "dependency graph and most-called functions."]
+    return "\n".join(lines) + "\n"
+
+
+def _build_module_page(mod: str, store, llm=None) -> str:
+    files = _module_files(store).get(mod, [])
+    symbols = sorted(
+        (n for n in store.all_nodes()
+         if n["kind"] != "file" and _top_module(n["file"]) == mod),
+        key=lambda n: n["qualified_name"],
+    )
+    deps = _module_imports(store, files)["imports"]
+
+    lines = [f"# Module `{mod}`", ""]
+    lines += [f"{len(files)} files, {len(symbols)} symbols.", ""]
+    if llm is not None and symbols:
+        facts = "; ".join(
+            f"{s['qualified_name']} ({s['kind']}) at {s['file']}:{s['line_start']}"
+            for s in symbols[:20]
+        )
+        prose = llm.complete(
+            "You are a technical writer. In 1-2 sentences, describe what this "
+            "module appears to do, using ONLY the facts given. Do not invent "
+            "details not present in the facts.",
+            f"Facts: {facts}",
+            max_tokens=200,
+        )
+        lines += [prose, ""]
+
+    lines += ["## Symbols", ""]
+    if symbols:
+        lines += ["| Kind | Symbol | Location |", "|---|---|---|"]
+        for s in symbols:
+            lines.append(
+                f"| {s['kind']} | `{s['qualified_name']}` "
+                f"| `{s['file']}:{s['line_start']}` |"
+            )
+    else:
+        lines.append("_No symbols._")
+    lines.append("")
+
+    classes = [s for s in symbols if s["kind"] == "class"]
+    if classes:
+        lines += ["## Class hierarchy", ""]
+        for c in classes:
+            try:
+                chain = Q.inheritance_chain(store, c["qualified_name"])
+            except Q.UnknownSymbol:
+                continue
+            bases = []
+            for b in chain:
+                if b.get("resolved"):
+                    bases.append(
+                        f"`{b['qualified_name']}` "
+                        f"(`{b['file']}:{b['line_start']}`)")
+                else:
+                    bases.append(f"`{b.get('raw')}` (external)")
+            if bases:
+                lines.append(
+                    f"- `{c['qualified_name']}` "
+                    f"(`{c['file']}:{c['line_start']}`) "
+                    f"extends {' → '.join(bases)}")
+        lines.append("")
+
+    lines += ["## Dependencies", ""]
+    if deps:
+        for d in deps:
+            lines.append(f"- `{d}`")
+    else:
+        lines.append("_No outgoing imports._")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _module_dependency_mermaid(store) -> tuple[str, bool]:
+    """Mermaid flowchart of module -> module dependencies.
+
+    Returns (diagram_markdown, truncated).
+    """
+    mods = _module_files(store)
+    # count edges per module for capping
+    counts: dict[str, int] = {}
+    pairs: set[tuple[str, str]] = set()
+    for mod, files in mods.items():
+        for f in files:
+            fnode = store.file_node(f)
+            if not fnode:
+                continue
+            for e in store.out_edges(fnode["id"], "imports"):
+                tgt = None
+                if e["dst"] is not None:
+                    t = store.get_node(e["dst"])
+                    if t:
+                        tgt = _top_module(t["file"])
+                if tgt and tgt != mod:
+                    pairs.add((mod, tgt))
+        counts[mod] = sum(1 for a, _ in pairs if a == mod)
+    ordered = sorted(mods, key=lambda m: (-counts.get(m, 0), m))
+    truncated = len(ordered) > MAX_MODULES_DIAGRAM
+    kept = set(ordered[:MAX_MODULES_DIAGRAM])
+    body_lines = ["flowchart LR"]
+    for mod in sorted(kept):
+        body_lines.append(f'    {_safe_id(mod)}["{mod}"]')
+    for a, b in sorted(pairs):
+        if a in kept and b in kept:
+            body_lines.append(f"    {_safe_id(a)} --> {_safe_id(b)}")
+    note = ""
+    if truncated:
+        note = (f"\n_Showing top {MAX_MODULES_DIAGRAM} of {len(ordered)} "
+                f"modules by dependency count._\n")
+    return _mermaid_block("mermaid", "\n".join(body_lines)) + note, truncated
+
+
+def _inheritance_mermaid(store) -> str:
+    """Class inheritance diagram (capped, honest about it)."""
+    classes = sorted(
+        (n for n in store.all_nodes() if n["kind"] == "class"),
+        key=lambda n: n["qualified_name"],
+    )[:MAX_MODULES_DIAGRAM]
+    if not classes:
+        return "_No classes found._"
+    body = ["classDiagram"]
+    for c in classes:
+        body.append(f'    class {_safe_id(c["qualified_name"])}')
+        for e in store.out_edges(c["id"], "inherits"):
+            if e["dst"] is None:
+                continue
+            base = store.get_node(e["dst"])
+            if base:
+                body.append(
+                    f"    {_safe_id(base['qualified_name'])} "
+                    f"<|-- {_safe_id(c['qualified_name'])}")
+    uniq = sorted(set(body[1:]))
+    return _mermaid_block("mermaid", "\n".join(["classDiagram"] + uniq))
+
+
+def _build_architecture(store) -> str:
+    diagram, _ = _module_dependency_mermaid(store)
+    lines = ["# Architecture", "",
+             "Derived from the code knowledge graph: module nodes are "
+             "top-level directories, arrows are `imports` edges between "
+             "files. Every arrow corresponds to a real import in the code.",
+             "",
+             "## Module dependencies", "", diagram, "",
+             "## Class inheritance", "", _inheritance_mermaid(store), "",
+             "## Most-called functions", "",
+             "Functions/methods with the most in-repo callers — the "
+             "load-bearing parts of the codebase.", ""]
+    most = store.most_called(MAX_MOST_CALLED)
+    if most:
+        lines += ["| Function | Callers | Location |",
+                  "|---|---|---|"]
+        for m in most:
+            lines.append(
+                f"| `{m['qualified_name']}` | {m['caller_count']} "
+                f"| `{m['file']}:{m['line_start']}` |")
+    else:
+        lines.append("_No call edges found._")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+# -- entry ---------------------------------------------------------------------
+def generate_wiki(repo: str | Path, out_dir: str | Path,
+                  db_path: str | Path | None = None,
+                  llm=None) -> dict:
+    """Generate the wiki. Returns ``{pages, out_dir, warning}``.
+
+    The staleness warning is printed to stderr *before* generating and
+    embedded in index.md.
+    """
+    root = Path(repo).resolve()
+    if not root.is_dir():
+        raise ValueError(f"not a directory: {root}")
+    out = Path(out_dir)
+    db = Path(db_path) if db_path else root / ".repopedia" / "graph.db"
+    if not db.exists():
+        raise ValueError(
+            f"no graph database at {db} — run `repopedia index {root}` first")
+
+    pages: list[str] = []
+    with open_store(db) as store:
+        warning = staleness_warning(root, store)
+        if warning:
+            print(warning, file=sys.stderr)
+
+        repo_name = root.name
+        (out / "modules").mkdir(parents=True, exist_ok=True)
+
+        index_md = _build_index(repo_name, store, warning, llm)
+        (out / "index.md").write_text(index_md, encoding="utf-8")
+        pages.append("index.md")
+
+        for mod in sorted(_module_files(store)):
+            page = _build_module_page(mod, store, llm)
+            # sanitize module name for the filesystem
+            fname = re.sub(r"[^\w\-.]", "_", mod) + ".md"
+            (out / "modules" / fname).write_text(page, encoding="utf-8")
+            pages.append(f"modules/{fname}")
+
+        arch = _build_architecture(store)
+        (out / "architecture.md").write_text(arch, encoding="utf-8")
+        pages.append("architecture.md")
+
+    return {"pages": sorted(pages), "out_dir": str(out), "warning": warning}

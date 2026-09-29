@@ -10,6 +10,7 @@ from pathlib import Path
 from . import __version__
 from .incremental import update_repo
 from .index import index_repo
+from .mcp_server import serve as mcp_serve
 from .query import (
     UnknownSymbol,
     blast_radius,
@@ -20,6 +21,7 @@ from .query import (
 )
 from .search import hybrid_search
 from .store import open_store
+from .wiki import generate_wiki
 
 
 def _db_for(args: argparse.Namespace) -> Path:
@@ -140,6 +142,30 @@ def cmd_search(args: argparse.Namespace) -> int:
     return _out(res, args.json)
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    db = Path(args.db) if args.db else Path(args.repo).resolve() / ".repopedia" / "graph.db"
+    if not db.exists():
+        print(f"error: no graph database at {db} — run `repopedia index {args.repo}` first",
+              file=sys.stderr)
+        return 1
+    print(f"repopedia MCP server: {db} (stdio)", file=sys.stderr)
+    mcp_serve(db)
+    return 0
+
+
+def cmd_wiki(args: argparse.Namespace) -> int:
+    out = Path(args.out) if args.out else Path(args.repo).resolve() / "docs"
+    try:
+        result = generate_wiki(args.repo, out, db_path=args.db)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"wiki written to {result['out_dir']}")
+    for page in result["pages"]:
+        print(f"  {page}")
+    return 0
+
+
 # -- parser -----------------------------------------------------------------
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--repo", default=".",
@@ -202,6 +228,21 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--top-k", type=int, default=10)
     _add_common(se)
     se.set_defaults(func=cmd_search)
+
+    mc = sub.add_parser("mcp", help="run the MCP server (stdio transport)")
+    mc.add_argument("--repo", default=".",
+                    help="repository root (default: current directory)")
+    mc.add_argument("--db", default=None,
+                    help="SQLite path (default: <repo>/.repopedia/graph.db)")
+    mc.set_defaults(func=cmd_mcp)
+
+    wi = sub.add_parser("wiki", help="generate a Markdown wiki from the graph")
+    wi.add_argument("repo", help="repository root")
+    wi.add_argument("--out", default=None,
+                    help="output directory (default: <repo>/docs)")
+    wi.add_argument("--db", default=None,
+                    help="SQLite path (default: <repo>/.repopedia/graph.db)")
+    wi.set_defaults(func=cmd_wiki)
     return p
 
 

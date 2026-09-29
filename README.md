@@ -20,8 +20,9 @@ flowchart LR
     B --> C[FileFacts<br/>symbols · calls · imports · inherits]
     C --> D[indexer<br/>cross-file resolution]
     D --> E[(SQLite graph<br/>nodes + edges)]
-    E --> F[Week 2: queries<br/>blast radius · incremental]
-    E --> G[Week 3: MCP server<br/>+ wiki generator]
+    E --> F[queries<br/>blast radius · incremental]
+    E --> G[MCP server<br/>7 tools]
+    E --> H[wiki generator<br/>pages + diagrams from graph]
 ```
 
 ## Querying the graph
@@ -68,6 +69,80 @@ file (callers, importers) get their references repaired too. Non-git
 directories fall back to a full reindex with a warning. One honest
 limitation: previously *unresolvable* edges in files that point at
 nothing changed stay unresolved until a full `repopedia index`.
+
+## MCP server: the graph for AI coding agents
+
+The graph's second consumer is not a human — it's your coding agent.
+`repopedia mcp` serves the query API over the Model Context Protocol
+(stdio), so Cursor, Claude Code, Windsurf, or any MCP client can traverse
+the codebase structurally instead of guessing from text search.
+
+```bash
+repopedia mcp --repo ./myrepo
+# repopedia MCP server: ./myrepo/.repopedia/graph.db (stdio)
+```
+
+The LLM is optional: only `ask_codebase` synthesizes prose, and only when
+`REPOPEDIA_LLM_BASE_URL` / `REPOPEDIA_LLM_API_KEY` / `REPOPEDIA_LLM_MODEL`
+are set (any OpenAI-compatible endpoint). Every other tool works
+offline, straight from the graph.
+
+| Tool | What it does |
+|---|---|
+| `find_symbol` | symbols by qualified/short name, each citing `file:line` |
+| `get_callers` / `get_callees` | one `calls` hop, each way (unresolved sites marked) |
+| `blast_radius` | transitive reverse calls + importing files (`depth` param) |
+| `search_codebase` | BM25 + one graph hop, ranked with `via: lexical\|graph` |
+| `get_file_symbols` | everything a file defines |
+| `ask_codebase` | retrieval + grounded synthesis; without an LLM it returns the evidence block and says so |
+
+Client configuration:
+
+```bash
+# Claude Code CLI
+claude mcp add repopedia -- repopedia mcp --repo /path/to/repo
+```
+
+```jsonc
+// Cursor / Windsurf / Claude Desktop — mcpServers
+{
+  "repopedia": {
+    "command": "repopedia",
+    "args": ["mcp", "--repo", "/path/to/repo"]
+  }
+}
+```
+
+## Wiki generator: documentation derived from the graph
+
+```bash
+repopedia wiki ./myrepo --out docs/
+# wiki written to ./myrepo/docs
+#   architecture.md
+#   index.md
+#   modules/auth.md
+#   ...
+```
+
+This is the anti-DeepWiki move: instead of an LLM reading text chunks and
+writing plausible prose, pages are **generated from graph edges** —
+module tables from `defines`, dependency lists from `imports`, the
+architecture diagram from the actual import graph, "most-called functions"
+from real call counts. Every structural claim cites `file:line`; Mermaid
+diagrams that exceed the node cap say so on the page.
+
+Before generating, repopedia compares the graph's `head_sha` against git
+HEAD. If the graph is stale, it prints a warning *and* embeds it in
+`index.md` — a wiki that might be outdated says so loudly instead of
+lying quietly. (Run `repopedia update` first; note that previously
+unresolved references in unchanged files only heal on a full reindex.)
+
+With an LLM configured (same env vars as above), `index.md` and module
+pages get short prose summaries synthesized under a strict
+cite-only-what-you're-given prompt. Without one, you get a deterministic
+structural wiki — tables plus diagrams, no prose claims — which is
+genuinely useful on its own: it answers "what lives where" with
+citations. Same graph → byte-identical markdown, every time.
 
 ## Search: BM25 + graph, no vectors (deliberate)
 
@@ -149,14 +224,15 @@ The schema is stable: Week 2 (query API, blast-radius = reverse `calls` traversa
 
 - **Week 1** ✅: tree-sitter indexer (Python + TypeScript), SQLite store, CLI
 - **Week 2** ✅: query API (callers/callees, blast radius, inheritance, file symbols), git-diff incremental reindex with reference repair, BM25 + graph hybrid search
-- **Week 3**: MCP server (find_symbol, get_callers, blast_radius, ask_codebase…), wiki generator (pages + Mermaid diagrams derived from the graph, every claim cited)
+- **Week 3** ✅: MCP server (7 tools: find_symbol, get_callers/callees, blast_radius, search_codebase, get_file_symbols, ask_codebase with optional grounded LLM synthesis), wiki generator (index + per-module pages + architecture, all derived from the graph with file:line citations, deterministic output, staleness warnings)
 - **Later**: more languages (Go, Java, Rust), vector embeddings as an optional supplement, hosted demo
 
-## Non-goals
+## What repopedia is NOT
 
-- **Not a DeepWiki clone.** DeepWiki-style tools generate prose from text chunks; repopedia generates *from the graph*. Different foundation, different accuracy properties.
-- **Not a vector-search wrapper.** Embeddings may come later as a supplement; the graph is the source of truth.
+- **Not a vector RAG clone.** No embeddings in MVP — deliberately. Structure first, vectors later as a supplement.
+- **Not a DeepWiki clone.** DeepWiki-style tools generate prose from text chunks; repopedia generates *from the graph*. Different foundation, different accuracy properties: our wiki pages are only as wrong as the parser, never as wrong as a hallucinating LLM.
 - **Not an IDE.** The graph is built for two consumers: humans reading generated wikis, and AI coding agents querying via MCP.
+- **Not magic.** Unresolved references (`dst=NULL`) are shown, not hidden. Stale graphs warn loudly. The LLM is instructed to cite only what the graph gave it — and when no LLM is configured, repopedia says so instead of faking synthesis.
 
 ## License
 
