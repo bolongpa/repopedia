@@ -3,7 +3,7 @@ Name: repopedia
 Version: 0.1.0
 Summary: MIT-licensed code knowledge graph: index any source repo into a queryable graph of symbols, calls, and dependencies
 Author: Bolong Pan
-License: MIT
+License-Expression: MIT
 Project-URL: Homepage, https://github.com/bolongpa/repopedia
 Keywords: code-graph,knowledge-graph,tree-sitter,code-search,mcp
 Requires-Python: >=3.10
