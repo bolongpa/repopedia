@@ -24,6 +24,63 @@ flowchart LR
     E --> G[Week 3: MCP server<br/>+ wiki generator]
 ```
 
+## Querying the graph
+
+```bash
+cd ./myrepo
+repopedia query callers pkg.mod.Service.run     # who calls it (file:line)
+repopedia query callees pkg.mod.Service.run     # what it calls (unresolved shown as <unresolved: raw>)
+repopedia query inherits pkg.mod.Service        # base classes, nearest first
+repopedia query file pkg/mod.py                 # symbols defined in a file
+repopedia blast-radius pkg.mod.Service.run --depth 3
+repopedia search "retry handler"                 # BM25 + one graph hop
+```
+
+`blast-radius` answers *"if I change this, what breaks?"*: transitive
+reverse `calls` traversal up to `--depth`, plus every file that imports
+the symbol's file. Each hit cites `file:line` and how it was reached
+(`calls(2)`, `imports`…). Add `--json` to any command for machine-readable
+output — the same functions back the Week 3 MCP server.
+
+Python API (all returns are plain JSON-serializable dicts/lists):
+
+```python
+from repopedia.store import open_store
+from repopedia import query
+
+with open_store("myrepo/.repopedia/graph.db") as s:
+    for hit in query.blast_radius(s, "pkg.mod.Service.run", depth=3):
+        print(hit["depth"], hit["via"], hit["qualified_name"],
+              f"{hit['file']}:{hit['line_start']}")
+```
+
+## Incremental updates
+
+```bash
+repopedia update ./myrepo
+# updated: +1 added, ~2 modified, -0 deleted
+```
+
+`update` diffs against the commit the graph was built from (stored as
+`head_sha` in the DB) and re-extracts only changed files, re-resolving
+their edges against the full store. Files that pointed *into* a changed
+file (callers, importers) get their references repaired too. Non-git
+directories fall back to a full reindex with a warning. One honest
+limitation: previously *unresolvable* edges in files that point at
+nothing changed stay unresolved until a full `repopedia index`.
+
+## Search: BM25 + graph, no vectors (deliberate)
+
+Code identifiers are not natural language. `"where is retry handled"`
+is answered better by matching the symbol `retry` / `handle_retry` and
+then *walking the graph* (who calls it, what file it's in) than by
+embedding the query into a vector space trained on prose. So
+`repopedia search` ranks symbols with a hand-rolled BM25 (~40 lines, zero
+dependencies) over qualified names, file paths, and kinds, then expands
+one hop along `calls` / `inherits` / `imports` to pull in structurally
+related symbols — marked `"via": "graph"` in the output. Structure beats
+embeddings for "where" questions; vectors may come later as a supplement.
+
 ## Quickstart
 
 ```bash
@@ -90,8 +147,8 @@ The schema is stable: Week 2 (query API, blast-radius = reverse `calls` traversa
 
 ## Roadmap
 
-- **Week 1** (this): tree-sitter indexer (Python + TypeScript), SQLite store, CLI
-- **Week 2**: query API (`where-defined`, callers/callees, blast radius), git-diff incremental reindex, BM25 + graph hybrid search
+- **Week 1** ✅: tree-sitter indexer (Python + TypeScript), SQLite store, CLI
+- **Week 2** ✅: query API (callers/callees, blast radius, inheritance, file symbols), git-diff incremental reindex with reference repair, BM25 + graph hybrid search
 - **Week 3**: MCP server (find_symbol, get_callers, blast_radius, ask_codebase…), wiki generator (pages + Mermaid diagrams derived from the graph, every claim cited)
 - **Later**: more languages (Go, Java, Rust), vector embeddings as an optional supplement, hosted demo
 

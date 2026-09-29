@@ -20,6 +20,10 @@ Schema (stable; Weeks 2-3 build on it — do not change column semantics):
 Indexes are placed on the columns Week 2 queries: qualified_name lookups,
 (kind) filters, file-scoped scans, and edge traversals by (src, kind) and
 (dst, kind) — the latter powers reverse call-graph (blast radius) queries.
+
+The ``meta`` table is small bookkeeping storage (Week 2 incremental reindex):
+``head_sha`` records the git commit the graph was built from, so
+``repopedia update`` can diff against it. It carries no graph semantics.
 """
 
 from __future__ import annotations
@@ -53,6 +57,10 @@ CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 CREATE INDEX IF NOT EXISTS idx_edges_src_kind ON edges(src, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_dst_kind ON edges(dst, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
+CREATE TABLE IF NOT EXISTS meta(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
 
 
@@ -67,6 +75,7 @@ class Store:
         self._conn.executescript(SCHEMA)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.commit()
+        self._closed = False
 
     # -- context manager ------------------------------------------------
     def __enter__(self) -> "Store":
@@ -76,6 +85,9 @@ class Store:
         self.close()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._conn.commit()
         self._conn.close()
 
@@ -149,6 +161,80 @@ class Store:
     def nodes_in_file(self, file: str) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM nodes WHERE file=? ORDER BY line_start", (file,)).fetchall()
         return [dict(r) for r in rows]
+
+    def all_nodes(self) -> list[dict]:
+        """Every node in the graph (used to build search corpora)."""
+        return [dict(r) for r in self._conn.execute("SELECT * FROM nodes").fetchall()]
+
+    def file_node(self, file: str) -> dict | None:
+        """The ``file``-kind node for a repo-relative path, if indexed."""
+        row = self._conn.execute(
+            "SELECT * FROM nodes WHERE kind='file' AND file=?", (file,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_file(self, file: str) -> int:
+        """Delete a file's node, its symbols, and every edge touching them.
+
+        Returns the number of nodes removed. Edges *from other files* into
+        the deleted file's nodes (e.g. calls, imports) are removed too.
+        """
+        ids = [r[0] for r in
+               self._conn.execute("SELECT id FROM nodes WHERE file=?", (file,))]
+        if not ids:
+            return 0
+        ph = ",".join("?" * len(ids))
+        self._conn.execute(
+            f"DELETE FROM edges WHERE src IN ({ph}) OR dst IN ({ph})",
+            (*ids, *ids),
+        )
+        self._conn.execute(f"DELETE FROM nodes WHERE id IN ({ph})", ids)
+        self._conn.commit()
+        return len(ids)
+
+    def delete_non_defines_edges(self, file: str) -> int:
+        """Delete a file's imports/calls/inherits edges (keeps defines).
+
+        Used by incremental reindex to re-resolve a file's references
+        without touching its nodes.
+        """
+        ids = [r[0] for r in
+               self._conn.execute("SELECT id FROM nodes WHERE file=?", (file,))]
+        if not ids:
+            return 0
+        ph = ",".join("?" * len(ids))
+        cur = self._conn.execute(
+            f"DELETE FROM edges WHERE src IN ({ph}) AND kind != 'defines'", ids
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def inbound_source_files(self, files: list[str]) -> list[str]:
+        """Distinct files (outside ``files``) with edges pointing into them."""
+        if not files:
+            return []
+        ph = ",".join("?" * len(files))
+        rows = self._conn.execute(
+            f"""SELECT DISTINCT n2.file FROM edges e
+                JOIN nodes n1 ON n1.id = e.dst
+                JOIN nodes n2 ON n2.id = e.src
+                WHERE n1.file IN ({ph}) AND n2.file NOT IN ({ph})""",
+            (*files, *files),
+        ).fetchall()
+        return sorted(r[0] for r in rows)
+
+    # -- meta bookkeeping ---------------------------------------------------
+    def get_meta(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        self._conn.commit()
 
     def stats(self) -> dict:
         n = self._conn.execute("SELECT kind, COUNT(*) c FROM nodes GROUP BY kind").fetchall()

@@ -63,6 +63,53 @@ def module_for(rel: str, language: str) -> str:
     return ".".join(p.with_suffix("").parts)
 
 
+_extractors: dict[str, object] | None = None
+
+
+def _get_extractors() -> dict[str, object]:
+    """Shared extractor instances (stateless across files)."""
+    global _extractors
+    if _extractors is None:
+        _extractors = {
+            "python": PythonExtractor(),
+            "typescript": TypeScriptExtractor(),
+            "tsx": TypeScriptExtractor(tsx=True),
+        }
+    return _extractors
+
+
+def parse_file(root: Path, path: Path, result: IndexResult) -> tuple[str, str, "FileFacts"] | None:
+    """Parse one file into (relpath, language, FileFacts).
+
+    Records the reason in ``result.skipped`` and returns None for files
+    that must not enter the graph. Shared by full index and incremental update.
+    """
+    rel = path.relative_to(root).as_posix()
+    lang = EXTENSIONS.get(path.suffix)
+    if lang is None:  # not a source file we handle
+        return None
+    try:
+        source = path.read_bytes()
+    except OSError as exc:
+        result.skipped.append(f"{rel} (unreadable: {exc})")
+        return None
+    try:
+        source.decode("utf-8")
+    except UnicodeDecodeError:
+        result.skipped.append(f"{rel} (not utf-8)")
+        return None
+    module = module_for(rel, "python" if lang == "python" else "typescript")
+    try:
+        facts = _get_extractors()[lang].extract(source, module)  # type: ignore[index]
+    except Exception as exc:  # never let one file kill the run
+        result.skipped.append(f"{rel} (parser crashed: {exc})")
+        return None
+    if facts.has_error:
+        result.skipped.append(f"{rel} (syntax errors)")
+        return None
+    return rel, lang, facts
+
+
 def _iter_source_files(root: Path, language: str):
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -88,41 +135,14 @@ def index_repo(root: str | Path, db_path: str | Path | None = None,
         raise ValueError(f"not a directory: {root}")
     db_path = Path(db_path) if db_path else root / ".repopedia" / "graph.db"
 
-    py_extractor = PythonExtractor()
-    ts_extractor = TypeScriptExtractor()
-    tsx_extractor = TypeScriptExtractor(tsx=True)
-
     result = IndexResult()
     # phase 1: parse every file
     parsed: list[tuple[str, str, FileFacts]] = []  # (relpath, language, facts)
     for path, lang in _iter_source_files(root, language):
-        rel = path.relative_to(root).as_posix()
-        try:
-            source = path.read_bytes()
-        except OSError as exc:
-            result.skipped.append(f"{rel} (unreadable: {exc})")
-            continue
-        try:
-            text = source.decode("utf-8")
-        except UnicodeDecodeError:
-            result.skipped.append(f"{rel} (not utf-8)")
-            continue
-        module = module_for(rel, "python" if lang == "python" else "typescript")
-        try:
-            if lang == "python":
-                facts = py_extractor.extract(source, module)
-            elif lang == "tsx":
-                facts = tsx_extractor.extract(source, module)
-            else:
-                facts = ts_extractor.extract(source, module)
-        except Exception as exc:  # never let one file kill the run
-            result.skipped.append(f"{rel} (parser crashed: {exc})")
-            continue
-        if facts.has_error:
-            result.skipped.append(f"{rel} (syntax errors)")
-            continue
-        parsed.append((rel, lang, facts))
-        result.files_parsed += 1
+        item = parse_file(root, path, result)
+        if item is not None:
+            parsed.append(item)
+            result.files_parsed += 1
 
     for skipped in result.skipped:
         warn(f"skipped {skipped}", quiet)
@@ -137,55 +157,85 @@ def index_repo(root: str | Path, db_path: str | Path | None = None,
     return result
 
 
+@dataclass
+class LookupMaps:
+    """Name-resolution indexes over the store's current nodes.
+
+    Rebuilt from the store (``build_lookup_maps``) so incremental updates
+    can re-resolve one file's edges against everything else.
+    """
+    file_ids: dict[str, int] = field(default_factory=dict)
+    qual_to_id: dict[str, int] = field(default_factory=dict)
+    short_to_ids: dict[str, list[int]] = field(default_factory=dict)
+    class_ids: dict[str, list[int]] = field(default_factory=dict)
+
+
+def build_lookup_maps(store: Store) -> LookupMaps:
+    """Build resolution maps from the nodes already in the store."""
+    maps = LookupMaps()
+    for row in store.all_nodes():
+        nid, kind, name, qual = row["id"], row["kind"], row["name"], row["qualified_name"]
+        maps.qual_to_id[qual] = nid
+        if kind == KIND_FILE:
+            maps.file_ids[row["file"]] = nid
+            continue
+        maps.short_to_ids.setdefault(name, []).append(nid)
+        if kind == "class":
+            maps.class_ids.setdefault(name, []).append(nid)
+    return maps
+
+
+def index_file_nodes(store: Store, root: Path, rel: str, lang: str,
+                     facts: FileFacts, maps: LookupMaps, result: IndexResult) -> None:
+    """Persist one parsed file's nodes (+ defines edges). Updates ``maps``."""
+    language = "python" if lang == "python" else "typescript"
+    fid = store.add_node(KIND_FILE, Path(rel).name, facts.module, rel, 1,
+                         _line_count(root, rel), language)
+    maps.file_ids[rel] = fid
+    maps.qual_to_id[facts.module] = fid
+    for sym in facts.symbols:
+        nid = store.add_node(sym.kind, sym.name, sym.qualified_name, rel,
+                             sym.line_start, sym.line_end, language)
+        maps.qual_to_id[sym.qualified_name] = nid
+        maps.short_to_ids.setdefault(sym.name, []).append(nid)
+        if sym.kind == "class":
+            maps.class_ids.setdefault(sym.name, []).append(nid)
+        store.add_edge(fid, nid, EDGE_DEFINES)
+        result.symbols += 1
+        result.edges += 1
+
+
+def resolve_file_edges(store: Store, root: Path, rel: str, lang: str,
+                       facts: FileFacts, maps: LookupMaps, result: IndexResult) -> None:
+    """Resolve and persist one file's imports/inherits/calls against ``maps``."""
+    fid = maps.file_ids[rel]
+    for imp in facts.imports:
+        target = _resolve_import(root, rel, lang, imp.module, imp.level)
+        data = {"module": imp.module}
+        store.add_edge(fid, maps.file_ids.get(target) if target else None,
+                       EDGE_IMPORTS, data)
+        result.edges += 1
+    for inh in facts.inherits:
+        dst = _resolve_class(inh.base, maps.class_ids, maps.qual_to_id)
+        store.add_edge(maps.qual_to_id[inh.class_qualified], dst, EDGE_INHERITS,
+                       {"raw": inh.base})
+        result.edges += 1
+    for call in facts.calls:
+        src = maps.qual_to_id.get(call.enclosing_qualified, fid)
+        dst, candidates = _resolve_call(call.raw, maps.short_to_ids, maps.class_ids)
+        data = {"raw": call.raw}
+        if dst is None and candidates:
+            data["candidates"] = candidates
+        store.add_edge(src, dst, EDGE_CALLS, data)
+        result.edges += 1
+
+
 def _persist(store: Store, root: Path, parsed, result: IndexResult, quiet: bool) -> None:
-    # -- nodes ---------------------------------------------------------
-    file_ids: dict[str, int] = {}
-    qual_to_id: dict[str, int] = {}
-    short_to_ids: dict[str, list[int]] = {}
-    class_ids: dict[str, list[int]] = {}
-
-    def reg_short(name: str, nid: int, is_class: bool) -> None:
-        short_to_ids.setdefault(name, []).append(nid)
-        if is_class:
-            class_ids.setdefault(name, []).append(nid)
-
+    maps = LookupMaps()
     for rel, lang, facts in parsed:
-        language = "python" if lang == "python" else "typescript"
-        fid = store.add_node(KIND_FILE, Path(rel).name, facts.module, rel, 1,
-                             _line_count(root, rel), language)
-        file_ids[rel] = fid
-        qual_to_id[facts.module] = fid
-        for sym in facts.symbols:
-            nid = store.add_node(sym.kind, sym.name, sym.qualified_name, rel,
-                                 sym.line_start, sym.line_end, language)
-            qual_to_id[sym.qualified_name] = nid
-            reg_short(sym.name, nid, sym.kind == "class")
-            store.add_edge(fid, nid, EDGE_DEFINES)
-            result.symbols += 1
-            result.edges += 1
-
-    # -- edges ----------------------------------------------------------
+        index_file_nodes(store, root, rel, lang, facts, maps, result)
     for rel, lang, facts in parsed:
-        fid = file_ids[rel]
-        for imp in facts.imports:
-            target = _resolve_import(root, rel, lang, imp.module, imp.level)
-            data = {"module": imp.module}
-            store.add_edge(fid, file_ids.get(target) if target else None,
-                           EDGE_IMPORTS, data)
-            result.edges += 1
-        for inh in facts.inherits:
-            dst = _resolve_class(inh.base, class_ids, qual_to_id)
-            store.add_edge(qual_to_id[inh.class_qualified], dst, EDGE_INHERITS,
-                           {"raw": inh.base})
-            result.edges += 1
-        for call in facts.calls:
-            src = qual_to_id.get(call.enclosing_qualified, fid)
-            dst, candidates = _resolve_call(call.raw, short_to_ids, class_ids)
-            data = {"raw": call.raw}
-            if dst is None and candidates:
-                data["candidates"] = candidates
-            store.add_edge(src, dst, EDGE_CALLS, data)
-            result.edges += 1
+        resolve_file_edges(store, root, rel, lang, facts, maps, result)
 
 
 def _line_count(root: Path, rel: str) -> int:

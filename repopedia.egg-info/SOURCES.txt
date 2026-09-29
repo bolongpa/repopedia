@@ -4,7 +4,10 @@ pyproject.toml
 repopedia/__init__.py
 repopedia/__main__.py
 repopedia/cli.py
+repopedia/incremental.py
 repopedia/index.py
+repopedia/query.py
+repopedia/search.py
 repopedia/store.py
 repopedia.egg-info/PKG-INFO
 repopedia.egg-info/SOURCES.txt
@@ -16,4 +19,7 @@ repopedia/extract/__init__.py
 repopedia/extract/base.py
 repopedia/extract/python.py
 repopedia/extract/typescript.py
+tests/test_incremental.py
 tests/test_index.py
+tests/test_query.py
+tests/test_search.py
