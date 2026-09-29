@@ -1,0 +1,2 @@
+[console_scripts]
+repopedia = repopedia.cli:main

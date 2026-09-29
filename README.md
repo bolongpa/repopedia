@@ -1,0 +1,106 @@
+# repopedia
+
+**Code is a graph — calls, dependencies, inheritance — but today's AI doc tools pretend it's text.** repopedia recovers the structure first (AST → knowledge graph), then grows answers, wikis, and impact analysis from the graph. The graph says what's true (every claim cites file:line); the LLM makes it readable.
+
+repopedia is MIT-licensed, local-first, and dependency-light: `pip install` and index any repo. No Docker, no server, no vendor lock-in.
+
+## Why a graph, not chunks
+
+Naive code understanding chunks source files, embeds them, and retrieves the top-k chunks most similar to a question. That works for *"where is the retry logic?"* — the answer sits in one chunk. It breaks on structural questions like:
+
+> *If I change `Engine.run`, what breaks?*
+
+No single chunk contains the answer. You need the call graph: who calls `run`, who calls *them*, and so on. Vector similarity can't do graph traversal; a knowledge graph can. repopedia builds that graph with tree-sitter (precise, language-aware parsing — not regexes), then answers from it.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Source repo<br/>.py / .ts / .tsx] --> B[tree-sitter<br/>extractors]
+    B --> C[FileFacts<br/>symbols · calls · imports · inherits]
+    C --> D[indexer<br/>cross-file resolution]
+    D --> E[(SQLite graph<br/>nodes + edges)]
+    E --> F[Week 2: queries<br/>blast radius · incremental]
+    E --> G[Week 3: MCP server<br/>+ wiki generator]
+```
+
+## Quickstart
+
+```bash
+pip install repopedia        # or: pip install -e .  (from source)
+repopedia index ./myrepo
+# indexed ./myrepo
+#   db:      ./myrepo/.repopedia/graph.db
+#   files:   132 parsed, 1 skipped
+#   symbols: 841
+#   edges:   2130
+```
+
+Limit to one language, or choose the DB location:
+
+```bash
+repopedia index ./myrepo --language py
+repopedia index ./myrepo --db /tmp/graph.db
+```
+
+Python API:
+
+```python
+from repopedia.store import open_store
+
+with open_store("myrepo/.repopedia/graph.db") as s:
+    for sym in s.find_symbol("Engine.run"):
+        print(sym["qualified_name"], sym["file"], sym["line_start"])
+    for e in s.in_edges(sym["id"], kind="calls"):   # who calls Engine.run?
+        print("called by:", e["src_qualified"], e["src_file"])
+```
+
+## What gets extracted
+
+| Language | Extensions | Symbols | Edges |
+|----------|-----------|---------|-------|
+| Python | `.py` | classes, functions, methods (incl. decorated/async/nested) | `defines`, `imports` (abs + relative), `calls`, `inherits` |
+| TypeScript | `.ts`, `.tsx` | classes, functions, methods (incl. exported) | `defines`, `imports` (relative), `calls` (+ `new`), `inherits` (`extends`) |
+
+Skipped, never fatal: `node_modules/`, `.git/`, `venv/`, `__pycache__/`, `dist/`, `build/`, non-UTF8 files, and files with syntax errors (logged as warnings — tree-sitter error recovery is deliberately *not* trusted for partial extraction).
+
+### Graph schema
+
+```sql
+nodes(id, kind, name, qualified_name, file, line_start, line_end, language)
+-- kind: file | class | function | method
+-- qualified_name: dotted path, e.g. "pkg.mod.Service.run"
+-- file: repo-relative path; line_* are 1-based inclusive
+
+edges(src, dst, kind, data)
+-- kind: defines | imports | calls | inherits
+-- dst is NULL when the reference can't be resolved in-repo
+-- data (JSON) always keeps the raw written form:
+--   imports  -> {"module": "pkg.util"}
+--   calls    -> {"raw": "helper"} (+ "candidates": N when ambiguous)
+--   inherits -> {"raw": "Base"}
+```
+
+**Resolution rules (heuristic, documented):**
+- *calls*: resolved by short name when unambiguous in the repo. `self.x` / `this.x` match method `x`; `ClassName(...)` resolves to the class node (constructor call). Ambiguous or unknown names stay `dst=NULL` with the raw name preserved for later phases to refine.
+- *imports*: resolved via normal module-resolution rules (`pkg/util.py`, `__init__.py`, `./util` → `util.ts(x)`/`index.ts(x)`). Stdlib, third-party, and bare specifiers stay unresolved with the module string recorded.
+- *inherits*: resolved when the base class name is unique in the repo.
+
+The schema is stable: Week 2 (query API, blast-radius = reverse `calls` traversal, git-diff incremental reindex) and Week 3 (MCP tools, wiki pages + Mermaid diagrams generated *from* the graph with file:line citations) build on exactly these tables.
+
+## Roadmap
+
+- **Week 1** (this): tree-sitter indexer (Python + TypeScript), SQLite store, CLI
+- **Week 2**: query API (`where-defined`, callers/callees, blast radius), git-diff incremental reindex, BM25 + graph hybrid search
+- **Week 3**: MCP server (find_symbol, get_callers, blast_radius, ask_codebase…), wiki generator (pages + Mermaid diagrams derived from the graph, every claim cited)
+- **Later**: more languages (Go, Java, Rust), vector embeddings as an optional supplement, hosted demo
+
+## Non-goals
+
+- **Not a DeepWiki clone.** DeepWiki-style tools generate prose from text chunks; repopedia generates *from the graph*. Different foundation, different accuracy properties.
+- **Not a vector-search wrapper.** Embeddings may come later as a supplement; the graph is the source of truth.
+- **Not an IDE.** The graph is built for two consumers: humans reading generated wikis, and AI coding agents querying via MCP.
+
+## License
+
+MIT — use it at work, ship it in products, no strings attached. See [LICENSE](LICENSE).
