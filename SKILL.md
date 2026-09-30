@@ -3,7 +3,7 @@ name: repopedia
 description: Use when working with a codebase's structure — finding who calls a function, what breaks if code changes (blast radius), looking up symbols, or generating code documentation. For Python/TypeScript repos indexed into a repopedia knowledge graph.
 license: MIT
 metadata:
-  version: "0.2.0"
+  version: "0.2.1"
   author: Bolong Pan
   homepage: https://github.com/bolongpa/repopedia
 ---
