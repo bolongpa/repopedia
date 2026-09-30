@@ -285,11 +285,11 @@ If you use this project in academic or technical work, please cite it as:
   title = {repopedia: an MIT-licensed code knowledge graph and wiki generator},
   year = {2026},
   url = {https://github.com/bolongpa/repopedia},
-  doi = {10.5281/zenodo.23034536}
+  doi = {10.5281/zenodo.23034535}
 }
 ```
 
-DOI: [10.5281/zenodo.23034536](https://doi.org/10.5281/zenodo.23034536)
+DOI (all versions, always resolves to latest): [10.5281/zenodo.23034535](https://doi.org/10.5281/zenodo.23034535)
 
 ## License
 
