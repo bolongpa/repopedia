@@ -275,6 +275,22 @@ The schema is stable: Week 2 (query API, blast-radius = reverse `calls` traversa
 - **Not an IDE.** The graph is built for two consumers: humans reading generated wikis, and AI coding agents querying via MCP.
 - **Not magic.** Unresolved references (`dst=NULL`) are shown, not hidden. Stale graphs warn loudly. The LLM is instructed to cite only what the graph gave it — and when no LLM is configured, repopedia says so instead of faking synthesis.
 
+## Citation
+
+If you use this project in academic or technical work, please cite it as:
+
+```bibtex
+@software{pan2026repopedia,
+  author = {Bolong Pan},
+  title = {repopedia: an MIT-licensed code knowledge graph and wiki generator},
+  year = {2026},
+  url = {https://github.com/bolongpa/repopedia},
+  doi = {10.5281/zenodo.23034536}
+}
+```
+
+DOI: [10.5281/zenodo.23034536](https://doi.org/10.5281/zenodo.23034536)
+
 ## License
 
 MIT — use it at work, ship it in products, no strings attached. See [LICENSE](LICENSE).
