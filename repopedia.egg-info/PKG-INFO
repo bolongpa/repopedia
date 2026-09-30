@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: repopedia
-Version: 0.2.0
+Version: 0.2.1
 Summary: MIT-licensed code knowledge graph: index any source repo into a queryable graph of symbols, calls, and dependencies
 Author: Bolong Pan
 License-Expression: MIT
